@@ -1,3 +1,4 @@
+# scraper/menu_scraper.py
 import requests
 from bs4 import BeautifulSoup
 import json
@@ -5,6 +6,7 @@ from datetime import datetime
 import time
 import re
 import os
+from pathlib import Path
 
 class BruinPlateScraper:
     def __init__(self):
