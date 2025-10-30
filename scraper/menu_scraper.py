@@ -6,7 +6,7 @@ from datetime import datetime
 import time
 import re
 import os
-from pathlib import Path
+
 
 class BruinPlateScraper:
     def __init__(self):
@@ -29,22 +29,23 @@ class BruinPlateScraper:
         soup = BeautifulSoup(response.text, 'html.parser')
         print(f"✓ Successfully fetched page (Status: {response.status_code})")
         
-        # Build a map of food items with their meal times
-        food_items_with_meals = self.map_foods_to_meals(soup)
+        # Build a map of food items with their meal times and categories
+        food_items_with_meta = self.map_foods_to_meals_and_sections(soup)
         
         if max_items:
-            food_items_with_meals = food_items_with_meals[:max_items]
+            food_items_with_meta = food_items_with_meta[:max_items]
         
-        total_items = len(food_items_with_meals)
+        total_items = len(food_items_with_meta)
         print(f"✓ Found {total_items} food items\n")
         
         all_foods = []
         
-        for idx, item_info in enumerate(food_items_with_meals, 1):
+        for idx, item_info in enumerate(food_items_with_meta, 1):
             try:
                 link = item_info['link']
                 food_name = item_info['name']
                 meal_time = item_info['meal_time']
+                category = item_info['category']
                 
                 # Get the detail page URL
                 detail_url = link.get('href')
@@ -57,76 +58,86 @@ class BruinPlateScraper:
                 if detail_url.startswith('/'):
                     detail_url = f"https://dining.ucla.edu{detail_url}"
                 
-                print(f"[{idx}/{len(food_items_with_meals)}] {food_name} ({meal_time})")
+                print(f"[{idx}/{len(food_items_with_meta)}] {food_name} ({meal_time}) [{category}]")
                 
                 # Fetch nutrition details
                 nutrition = self.get_nutrition_details(detail_url, food_name, meal_time)
                 
                 if nutrition:
+                    nutrition['category'] = category
                     all_foods.append(nutrition)
                     print(f"  ✓ {nutrition['calories']} cal, {nutrition['protein']}g protein\n")
                 else:
                     print(f"  ✗ Failed to extract nutrition\n")
                 
-                # Be respectful to the server
                 time.sleep(0.5)
-                
             except Exception as e:
                 print(f"  ✗ Error: {e}\n")
                 continue
         
         print(f"\n{'='*60}")
-        print(f"Successfully extracted {len(all_foods)}/{len(food_items_with_meals)} food items")
+        print(f"Successfully extracted {len(all_foods)}/{len(food_items_with_meta)} food items")
         print(f"{'='*60}\n")
         
-        # Save to JSON
         self.save_to_json(all_foods)
-        
         return all_foods
     
-    def map_foods_to_meals(self, soup):
+    def map_foods_to_meals_and_sections(self, soup):
         """
-        Map each food item to its meal time (breakfast/lunch/dinner)
-        by tracking which meal section heading comes before it
+        Map each food item to its meal time and section/category
         """
         food_items = []
-        current_meal = "unknown"
         
-        # Find all "See Meal Details" links
+        # Known section headers (lowercase, normalized)
+        SECTION_HEADERS = [
+            'freshly bowled', 'harvest', 'stone fired', 'simply grilled',
+            'farmstand', 'soups', 'fruit', 'sweet bites', 'yogurt bar',
+            'cereal / oatmeal', 'beverage special', 'greens \'n more',
+            'frozen yogurt', 'grab & go'
+        ]
+        
         all_links = soup.find_all('a', string='See Meal Details')
         
         for link in all_links:
-            # Find the food name from heading near this link
             food_name = self.extract_food_name(link)
             
-            # Find which meal section this food belongs to
-            # Look backwards through the page for the nearest h2 with BREAKFAST/LUNCH/DINNER
+            # Find category by searching backwards for section headers (must match known list)
+            food_category = "unknown"
             current_element = link
-            meal_found = False
-            
-            # Search up through parents and previous siblings
-            for _ in range(50):  # Limit search depth
-                # Check previous siblings
+
+            for _ in range(30):  # Search depth limit
+                prev_heading = current_element.find_previous(['h2', 'h3', 'h4'])
+                if not prev_heading:
+                    break
+                heading_text = prev_heading.get_text(strip=True).lower()
+                # Must match known section exactly (not food names)
+                # Use normalized comparison and ignore case
+                match = next((section for section in SECTION_HEADERS if section in heading_text), None)
+                if match:
+                    food_category = match.title()  # For nice capitalization
+                    break
+                
+                # Stop if we hit a meal header (we've gone too far)
+                if any(meal in heading_text for meal in ['breakfast', 'lunch', 'dinner']):
+                    break
+                current_element = prev_heading
+
+            # Find meal time
+            current_meal = "unknown"
+            current_element = link
+            for _ in range(50):
                 prev = current_element.find_previous(['h2', 'h1'])
                 if prev:
                     heading_text = prev.get_text(strip=True).upper()
                     if 'BREAKFAST' in heading_text:
                         current_meal = 'breakfast'
-                        meal_found = True
-                        break
-                    elif 'Grab & Go' in heading_text:
-                        current_meal = 'lunch'
-                        meal_found = True
                         break
                     elif 'LUNCH' in heading_text:
                         current_meal = 'lunch'
-                        meal_found = True
                         break
                     elif 'DINNER' in heading_text:
                         current_meal = 'dinner'
-                        meal_found = True
                         break
-                    # Keep searching backwards
                     current_element = prev
                 else:
                     break
@@ -134,24 +145,23 @@ class BruinPlateScraper:
             food_items.append({
                 'link': link,
                 'name': food_name,
-                'meal_time': current_meal
+                'meal_time': current_meal,
+                'category': food_category
             })
         
         return food_items
+
     
     def extract_food_name(self, link):
         """Extract food name from the menu page"""
         food_name = "Unknown"
-        
         try:
-            # Method 1: Look in parent container
             parent = link.find_parent(['li', 'div', 'article'])
             if parent:
                 heading = parent.find(['h3', 'h4', 'h5'])
                 if heading:
                     food_name = heading.get_text(strip=True)
             
-            # Method 2: Look at previous sibling heading
             if food_name == "Unknown":
                 prev_heading = link.find_previous(['h3', 'h4', 'h5'])
                 if prev_heading:
@@ -162,8 +172,7 @@ class BruinPlateScraper:
                          'stone fired', 'simply grilled', 'farmstand', 'soups', 'fruit', 
                          'sweet bites', 'yogurt', 'cereal', 'beverage', 'greens']):
                         food_name = heading_text
-        
-        except Exception as e:
+        except Exception:
             pass
         
         return food_name
@@ -178,13 +187,11 @@ class BruinPlateScraper:
             
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # If food name is still Unknown, try to get it from the detail page
             if food_name == "Unknown":
                 title = soup.find(['h1', 'h2'])
                 if title:
                     food_name = title.get_text(strip=True)
             
-            # Initialize nutrition data
             nutrition = {
                 'name': food_name,
                 'meal_time': meal_time,
@@ -199,7 +206,6 @@ class BruinPlateScraper:
                 'dietary_tags': []
             }
             
-            # Get text content
             page_text = soup.get_text()
             
             # Extract serving size
@@ -212,36 +218,31 @@ class BruinPlateScraper:
             if calories_match:
                 nutrition['calories'] = float(calories_match.group(1))
             
-            # Extract Total Fat
+            # Extract macros
             fat_match = re.search(r'Total Fat\s*([\d.]+)\s*g', page_text, re.IGNORECASE)
             if fat_match:
                 nutrition['fat'] = float(fat_match.group(1))
             
-            # Extract Total Carbohydrate
             carb_match = re.search(r'Total Carbohydrate\s*([\d.]+)\s*g', page_text, re.IGNORECASE)
             if carb_match:
                 nutrition['carbs'] = float(carb_match.group(1))
             
-            # Extract Protein
             protein_match = re.search(r'Protein\s*([\d.]+)\s*g', page_text, re.IGNORECASE)
             if protein_match:
                 nutrition['protein'] = float(protein_match.group(1))
             
-            # Extract Dietary Fiber
             fiber_match = re.search(r'Dietary Fiber\s*([\d.]+)\s*g', page_text, re.IGNORECASE)
             if fiber_match:
                 nutrition['fiber'] = float(fiber_match.group(1))
             
-            # Extract Sodium
             sodium_match = re.search(r'Sodium\s*([\d.]+)\s*mg', page_text, re.IGNORECASE)
             if sodium_match:
                 nutrition['sodium'] = float(sodium_match.group(1))
             
-            # Extract allergen/dietary information
+            # Extract dietary tags
             allergen_match = re.search(r'Allergens\*?:\s*([^\n]+)', page_text, re.IGNORECASE)
             if allergen_match:
                 allergen_text = allergen_match.group(1).lower()
-                
                 if 'gluten' in allergen_text:
                     nutrition['dietary_tags'].append('contains_gluten')
                 if 'dairy' in allergen_text or 'milk' in allergen_text:
@@ -249,7 +250,6 @@ class BruinPlateScraper:
                 if 'eggs' in allergen_text:
                     nutrition['dietary_tags'].append('contains_eggs')
             
-            # Check for vegetarian/vegan
             if 'vegan' in page_text.lower():
                 nutrition['dietary_tags'].append('vegan')
             elif 'vegetarian' in page_text.lower():
@@ -271,8 +271,6 @@ class BruinPlateScraper:
         }
         
         filename = 'data/menu_data.json'
-        
-        # Create data directory if it doesn't exist
         os.makedirs('data', exist_ok=True)
         
         with open(filename, 'w') as f:
@@ -280,7 +278,6 @@ class BruinPlateScraper:
         
         print(f"✓ Saved {len(foods)} items to {filename}")
         
-        # Print summary stats
         breakfast_count = sum(1 for f in foods if f['meal_time'] == 'breakfast')
         lunch_count = sum(1 for f in foods if f['meal_time'] == 'lunch')
         dinner_count = sum(1 for f in foods if f['meal_time'] == 'dinner')
@@ -290,7 +287,6 @@ class BruinPlateScraper:
         print(f"  Lunch: {lunch_count} items")
         print(f"  Dinner: {dinner_count} items")
         
-        # Print nutrition stats
         if foods:
             avg_calories = sum(f['calories'] for f in foods) / len(foods)
             avg_protein = sum(f['protein'] for f in foods) / len(foods)
@@ -301,11 +297,6 @@ class BruinPlateScraper:
 
 if __name__ == "__main__":
     scraper = BruinPlateScraper()
-    
-    # Test with just 20 items first
-    print("TEST MODE: Processing first 20 items\n")
+    print("Scraping full menu...\n")
     print("="*60)
-    foods = scraper.scrape_menu(max_items=60)
-    
-    # To scrape all items, uncomment the line below:
-    # foods = scraper.scrape_menu()
+    foods = scraper.scrape_menu()  # Full scrape
